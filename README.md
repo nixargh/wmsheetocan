@@ -5,4 +5,4 @@ wmsheetocan
 
 ### Usage example:
 
-* `wmsheetocan -b black`
+* `wmsheetocan -b black -f /pat/to/timesheet`
