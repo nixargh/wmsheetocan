@@ -1,0 +1,332 @@
+#!/usr/bin/python
+# -*- coding: utf-8 -*-
+"""wmsheetocan
+
+WindowMaker dockapp to show 'sheetocan' output.
+Sheetocan - https://github.com/nixargh/sheetocan
+
+Copyright (C) 2016 nixargh <nixarg@gmail.com>
+
+Licensed under the GNU General Public License Version 3.
+
+
+Changes
+2016-03-21 nixargh <nixargh@gmail.com>
+Rewrite pywmgeneric.py to create dock app for sheetocan.
+
+2003-07-02 Kristoffer Erlandsson
+Added support for up to 10 mouse buttons.
+The char translation now handles both upper and lower case.
+
+2003-06-29 Kristoffer Erlandsson
+Additional error checking around string interpolations from cfg file.
+
+2003-06-27 Kristoffer Erlandsson
+First working version
+"""
+
+usage = """wmsheetocan [options]
+Available options are:
+    -h, --help                  print this help
+    -t, --text <color>          set the text color
+    -b, --background <color>    set the background color
+    -F, --font <file>           set the font name
+    -r, --rgbfile <file>        set the rgb file to get color codes from
+    -f, --timesheet <file>      path to timesheet file
+"""
+
+__version__ = "0.1.0"
+
+import sys
+import os
+import time
+import string
+import ConfigParser
+import getopt
+import popen2
+import wmdocklib
+
+width = 64
+height = 64
+
+xOffset = 4
+yOffset = 4
+
+maxChars = 13
+
+defaultRGBFiles = ('/usr/share/X11/rgb.txt', '/usr/X11R6/lib/X11/rgb.txt')
+
+err = sys.stderr.write
+
+def addString(s, x, y):
+    """Convenience function around pwymhelpers.addString."""
+    try:
+        wmdocklib.addString(s, x, y, xOffset, yOffset,
+                            width, height)
+    except ValueError, e:
+        sys.stderr.write('Error when painting string:\n' + str(e) + '\n')
+        sys.exit(3)
+
+def clearLine(y):
+    """Clear a line of text at position y."""
+    wmdocklib.copyXPMArea(0, 64+yOffset,
+                          width - 2 * xOffset, char_height,
+                          xOffset, y + yOffset)
+
+def getXY(line):
+    """Return the x and y positions to be used at line line."""
+    return 0, line * (char_height + 3) + 1
+
+class Entry:
+    def __init__(self, timesheet):
+        self._updateDelay = 10
+        self._line = 0
+        self._command = "sheetocan -w -r -b 4 %s" % timesheet
+        self._display = 0
+
+        self._glue = ' ... '
+        self._tickCount = 0L
+
+        self._runningProcs = []
+        self._actionProc = None
+        self._getTextMethod = None
+        self._displayLine = ''
+        # Do one action when we start, so we are sure that one gets done even
+        # if we do not want any other updates.
+        self._doAction()
+        self._lastActionAt = time.time()
+
+    def _execExternal(self, command):
+        """Exec an external command in the background.
+        
+        Return the running process as created by Popen3()."""
+        proc = popen2.Popen3(command)
+        self._runningProcs.append(proc)
+        return proc
+
+    def _doAction(self):
+        """Perform the action associated with this entry."""
+        if self._actionProc is None :
+            self._actionProc = self._execExternal(self._command)
+        else:
+            if not self._actionProc in self._runningProcs:
+                # The action process since the last time is finished, we
+                # can start another one without risking that we get
+                # flooded by processes.
+                self._actionProc = self._execExternal(self._command)
+        self._getTextMethod = self._readFromActionProc
+            
+    def _readFromActionProc(self):
+        """If our action process is ready, return the output. Otherwise None.
+        """
+        if self._actionProc.poll() == -1:
+            # Wait until the process is ready before we really read the text.
+            return None
+        # fromchild.read() will return '' if we allready have read the output
+        # so there will be no harm in calling this method more times.
+        return self._actionProc.fromchild.read()
+
+    def _reapZombies(self):
+        """Poll all running childs. This will reap all zombies."""
+        i = 0
+        for p in self._runningProcs:
+            val = p.poll()
+            if val != -1:
+                self._runningProcs.pop(i)
+            i += 1
+
+    def _updateText(self):
+        """Get the text, update the display if it has changed.
+        """
+        text = ''
+        if self._getTextMethod:
+            text = self._getTextMethod()
+            # Only change the text if we get anything from the getTextMethod()
+            if text:
+                self._allText = text
+        if text:
+            displayLine = text
+        else:
+            displayLine = self._displayLine
+        if displayLine != self._displayLine:
+            # Line to display has changed, display the new one.
+            self._displayLine = displayLine
+            self.displayText(displayLine)
+
+    def tick1(self):
+        """Do things that should be done often.
+        """
+        self._tickCount += 1
+        self._reapZombies()
+        self._updateText()
+        currTime = time.time()
+        if not self._updateDelay is None and \
+                currTime - self._lastActionAt > self._updateDelay:
+            # We want to do this last in the tick so the command gets the time
+            # to finish before the next tick (if it's a fast one).
+            self._lastActionAt = currTime
+            self._doAction()
+
+    def getDisplayedLine(self):
+        return self._displayLine
+
+    def displayText(self, text):
+        """Display text on the entry.
+        
+        Truncate the text to fit in the app.
+        """
+        x, y = getXY(self._line)
+        for line in text.split("\n"):
+            clearLine(y)
+            addString(line[:maxChars], x, y)
+            y += 11
+
+class WMSeetocan:
+    def __init__(self, timesheet):
+        self._entry = Entry(timesheet)
+
+    def mainLoop(self):
+        counter = -1
+        while 1:
+            counter += 1
+            self._entry.tick1()
+
+            if counter == 999999:
+                counter = -1
+            wmdocklib.redraw()
+            time.sleep(1)
+
+def parseCommandLine(argv):
+    """Parse the commandline. Return a dictionary with options and values."""
+    shorts = 'ht:b:r:c:F:f:'
+    longs = ['help', 'text=', 'background=', 'rgbfile=', 'configfile=',
+             'font=', 'debug']
+    try:
+        opts, nonOptArgs = getopt.getopt(argv[1:], shorts, longs)
+    except getopt.GetoptError, e:
+        err('Error when parsing commandline: ' + str(e) + '\n')
+        err(usage)
+        sys.exit(2)
+    d = {} 
+    for o, a in opts:
+        if o in ('-h', '--help'):
+            sys.stdout.write(usage)
+            sys.exit(0)
+        if o in ('-t', '--text'):
+            d['text'] = a
+        if o in ('-b', '--background'):
+            d['background'] = a
+        if o in ('-F', '--font'):
+            d['font'] = a
+        if o in ('-r', '--rgbfile'):
+            d['rgbfile'] = a
+    	if o in ('-f'):
+	        d['timesheet'] = a
+        if o in ('--debug'):
+            d['debug'] = True
+    return d
+
+
+background = \
+[
+ ' ...............................................................................................',
+ ' .///..___..ooo..___..___.......................................................................',
+ ' .///..___..ooo..___..___.......................................................................',
+ ' .///..___..ooo..___..___.......................................................................',
+ ' .///.._________________________________________________________________________________________',
+ ' .///.._________________________________________________________________________________________',
+ ' .///.._________________________________________________________________________________________',
+ ' .///.._________________________________________________________________________________________',
+ ' .///.._________________________________________________________________________________________',
+ ' .///.._________________________________________________________________________________________',
+ ' .///.._________________________________________________________________________________________',
+ ' .///.._________________________________________________________________________________________',
+ ' .///..___..___..___..___.......................................................................',
+ ' .///..___..___..___..ooo.......................................................................',
+ ' .///..___..___..___..ooo.......................................................................',
+ ' .///..___..___..___..ooo.......................................................................',
+ ' .///...........................................................................................',
+ ' .///...........................................................................................',
+ ' .///...........................................................................................',
+ ' .///...........................................................................................',
+ ' .///...........................................................................................',
+ ' .///...........................................................................................',
+ ' .///...........................................................................................',
+ ' .///...........................................................................................',
+ ' .///...........................................................................................',
+ ' .///...........................................................................................',
+ ' .///...........................................................................................',
+ ' .///...........................................................................................',
+ ' .///...........................................................................................',
+ ' .///...........................................................................................',
+ ' .///...........................................................................................',
+ ' .///...........................................................................................',
+ ' .///...........................................................................................',
+ ' .///...........................................................................................',
+ ' .///...........................................................................................',
+ ' .///...........................................................................................',
+ ' .///...........................................................................................',
+ ' .///...........................................................................................',
+ ' .///...........................................................................................',
+ ' .///...........................................................................................',
+ ' .///...........................................................................................',
+ ' .///...........................................................................................',
+ ' .///...........................................................................................',
+ ' .///...........................................................................................',
+ ' .///...........................................................................................',
+ ' .///...........................................................................................',
+ ' .///...........................................................................................',
+ ' .///...........................................................................................',
+ ' .///...........................................................................................',
+ ' .///...........................................................................................',
+ ' .///...........................................................................................',
+ ' .///...........................................................................................',
+ ' .///...........................................................................................',
+ ' .///...-------------------------------------------------------------------------------------...',
+ ' .///...-------------------------------------------------------------------------------------...',
+ ' .///...-------------------------------------------------------------------------------------...',
+ ' .///...-------------------------------------------------------------------------------------...',
+ ' .///...........................................................................................',
+ ' .///////////////////////////////////////////////////////////////////////////////////////////...',
+ ' .///////////////////////////////////////////////////////////////////////////////////////////...',
+ ' .///////////////////////////////////////////////////////////////////////////////////////////...',
+ ' .///////////////////////////////////////////////////////////////////////////////////////////...',
+ ' ...............................................................................................',
+ ' ...............................................................................................',
+ ]
+
+def main():
+    clConfig = parseCommandLine(sys.argv)
+
+    palette = {
+        '.': '#0000FF',
+        'o': '#C7C3C7',
+        'O': '#86828E',
+        '+': '#EFF3EF',
+        '@': '#616161',
+        '#': '#9EA29E',
+        '$': '#414141',
+        }
+
+    palette['o'] = clConfig.get('indicator', '#20b2aa')
+    palette['/'] = clConfig.get('graph', '#20b2aa')
+    palette['-'] = clConfig.get('graphbg', '#707070')
+    palette['_'] = clConfig.get('background', '#FFFFFF')
+    palette['%'] = clConfig.get('text', '#20B2AE')
+
+    font = clConfig.get('font', '6x8')
+
+    programName = os.path.basename(__file__)
+
+    global char_width, char_height
+    char_width, char_height = wmdocklib.initPixmap(#patterns=background,
+                                                   font_name=font,
+                                                   bg='_', fg='%',
+                                                   palette=palette)
+
+    wmdocklib.openXwindow(sys.argv, width, height)
+    wms = WMSeetocan(clConfig.get('timesheet'))
+    wms.mainLoop()
+
+if __name__ == '__main__':
+    main()
